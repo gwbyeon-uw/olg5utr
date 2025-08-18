@@ -1,9 +1,10 @@
 import torch
 import torch.nn.functional as F
+from torch.utils.data import TensorDataset, DataLoader
 
 import numpy as np
 
-from typing import List, Iterator, Tuple, Optional, Union
+from typing import List, Iterator, Tuple, Optional, Union, Literal
 
 DNA_ALPHABET = list('ACGT')
 AA_ALPHABET = list('ACDEFGHIKLMNPQRSTVWYX')
@@ -201,7 +202,7 @@ def quantile_normalize_binned(
     
     return normalized_values
 
-def scaler(rl: ArrayLike) -> ArrayLike: #Z-score normalization
+def scaler(rl: torch.Tensor) -> torch.Tensor : #Z-score normalization
     m = rl.mean()
     s = rl.std()
 
@@ -365,3 +366,322 @@ def bin_2d_by_quantiles(
     )
     
     return bin_averages, bin_counts, thresholds
+
+class KmerCounter:
+    """
+    Efficient k-mer counter for one-hot encoded DNA sequences.
+    Handles N's (all zeros) and provides option to exclude k-mers containing N's.
+    """
+    
+    def __init__(self, k: int, device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
+        """
+        Initialize k-mer counter.
+        
+        Args:
+            k: k-mer length
+            device: torch device to use
+        """
+        self.k = k
+        self.device = device
+        self.vocab_size = 5 ** k  # 5 possible values: A, T, G, C, N
+        
+        # Create powers for base-5 conversion
+        self.powers = torch.tensor([5 ** i for i in range(k-1, -1, -1)], 
+                                   dtype=torch.long, device=device)
+        
+        # Create mask for identifying k-mers with N's
+        self._create_n_mask()
+    
+    def _create_n_mask(self):
+        """Create a mask to identify which k-mer indices contain N's."""
+        # Generate all possible k-mer indices
+        all_kmers = torch.arange(self.vocab_size, device=self.device)
+        
+        # Convert to base-5 representation and check for 4's (N's)
+        has_n = torch.zeros(self.vocab_size, dtype=torch.bool, device=self.device)
+        
+        # Check each k-mer index for N's
+        for idx in range(self.vocab_size):
+            base5 = []
+            num = idx
+            for _ in range(self.k):
+                base5.append(num % 5)
+                num //= 5
+            has_n[idx] = 4 in base5
+        
+        self.n_mask = has_n
+    
+    def one_hot_to_indices(self, one_hot: torch.Tensor) -> torch.Tensor:
+        """
+        Convert one-hot encoded sequences to base-5 indices.
+        
+        Args:
+            one_hot: Tensor of shape (batch, 4, length) or (4, length)
+        
+        Returns:
+            Tensor of indices where A=0, T=1, G=2, C=3, N=4
+        """
+        # Sum along channel dimension to get indices 0-3 for ATGC
+        # All zeros will remain 0
+        indices = torch.argmax(one_hot, dim=-2 if one_hot.dim() == 3 else 0)
+        
+        # Identify N's (positions where all channels are 0)
+        is_n = (one_hot.sum(dim=-2 if one_hot.dim() == 3 else 0) == 0)
+        
+        # Set N positions to 4
+        indices[is_n] = 4
+        
+        return indices
+    
+    def extract_kmers(self, sequences: torch.Tensor) -> torch.Tensor:
+        """
+        Extract all k-mers from sequences using sliding window.
+        
+        Args:
+            sequences: Tensor of shape (batch, 4, length) with one-hot encoding
+        
+        Returns:
+            Tensor of k-mer indices of shape (batch, num_kmers)
+        """
+        batch_size, _, seq_len = sequences.shape
+        num_kmers = seq_len - self.k + 1
+        
+        # Convert to indices (A=0, T=1, G=2, C=3, N=4)
+        indices = self.one_hot_to_indices(sequences)  # (batch, length)
+        
+        # Use unfold to extract k-mers efficiently
+        kmers = indices.unfold(dimension=1, size=self.k, step=1)  # (batch, num_kmers, k)
+        
+        # Convert k-mers to single indices in base-5
+        kmer_indices = (kmers * self.powers).sum(dim=-1)  # (batch, num_kmers)
+        
+        return kmer_indices
+    
+    def count_kmers(self, 
+                   sequences: torch.Tensor, 
+                   exclude_n: bool = False,
+                   return_dense: bool = True) -> torch.Tensor:
+        """
+        Count k-mers in batch of sequences.
+        
+        Args:
+            sequences: Tensor of shape (batch, 4, length) with one-hot encoding
+            exclude_n: If True, exclude k-mers containing N's from counts
+            return_dense: If True, return dense count matrix; if False, return sparse
+        
+        Returns:
+            If return_dense: Tensor of shape (batch, 5^k) with k-mer counts
+            If not return_dense: Tuple of (indices, values, shape) for sparse tensor
+        """
+        batch_size = sequences.shape[0]
+        
+        # Extract k-mer indices
+        kmer_indices = self.extract_kmers(sequences)  # (batch, num_kmers)
+        
+        if exclude_n:
+            # Mask out k-mers containing N's
+            mask = ~self.n_mask[kmer_indices]
+            kmer_indices = kmer_indices * mask - 1  # Set masked values to -1
+        
+        # Count k-mers for each sequence in batch
+        if return_dense:
+            counts = torch.zeros(batch_size, self.vocab_size, 
+                                dtype=torch.long, device=self.device)
+            
+            for b in range(batch_size):
+                seq_kmers = kmer_indices[b]
+                if exclude_n:
+                    seq_kmers = seq_kmers[seq_kmers >= 0]  # Remove -1 values
+                
+                # Use bincount for efficient counting
+                if seq_kmers.numel() > 0:
+                    bincount = torch.bincount(seq_kmers, minlength=self.vocab_size)
+                    counts[b] = bincount
+            
+            return counts
+        else:
+            # Return sparse representation
+            all_indices = []
+            all_values = []
+            
+            for b in range(batch_size):
+                seq_kmers = kmer_indices[b]
+                if exclude_n:
+                    seq_kmers = seq_kmers[seq_kmers >= 0]
+                
+                if seq_kmers.numel() > 0:
+                    unique_kmers, counts = torch.unique(seq_kmers, return_counts=True)
+                    batch_indices = torch.full_like(unique_kmers, b)
+                    indices = torch.stack([batch_indices, unique_kmers])
+                    all_indices.append(indices)
+                    all_values.append(counts)
+            
+            if all_indices:
+                indices = torch.cat(all_indices, dim=1)
+                values = torch.cat(all_values)
+                return torch.sparse_coo_tensor(indices, values, 
+                                              (batch_size, self.vocab_size))
+            else:
+                return torch.sparse_coo_tensor(torch.zeros(2, 0, dtype=torch.long),
+                                              torch.zeros(0, dtype=torch.long),
+                                              (batch_size, self.vocab_size))
+    
+    def count_kmers_chunked(self,
+                           sequences: torch.Tensor,
+                           chunk_size: int = 10000,
+                           exclude_n: bool = False) -> torch.Tensor:
+        """
+        Count k-mers in very large batches using chunking for memory efficiency.
+        
+        Args:
+            sequences: Tensor of shape (batch, 4, length) with one-hot encoding
+            chunk_size: Number of sequences to process at once
+            exclude_n: If True, exclude k-mers containing N's from counts
+        
+        Returns:
+            Tensor of shape (batch, 5^k) with k-mer counts
+        """
+        batch_size = sequences.shape[0]
+        counts = torch.zeros(batch_size, self.vocab_size, 
+                            dtype=torch.long, device=self.device)
+        
+        for i in range(0, batch_size, chunk_size):
+            end_idx = min(i + chunk_size, batch_size)
+            chunk = sequences[i:end_idx]
+            counts[i:end_idx] = self.count_kmers(chunk, exclude_n=exclude_n)
+        
+        return counts
+    
+    def kmer_to_sequence(self, kmer_idx: int) -> str:
+        """
+        Convert k-mer index back to sequence string.
+        
+        Args:
+            kmer_idx: Index of k-mer in base-5 representation
+        
+        Returns:
+            String representation of k-mer
+        """
+        bases = ['A', 'T', 'G', 'C', 'N']
+        sequence = []
+        
+        for _ in range(self.k):
+            sequence.append(bases[kmer_idx % 5])
+            kmer_idx //= 5
+        
+        return ''.join(reversed(sequence))
+    
+    def get_top_kmers(self, 
+                     counts: torch.Tensor, 
+                     top_k: int = 10,
+                     exclude_n: bool = True) -> list:
+        """
+        Get top k most frequent k-mers from count matrix.
+        
+        Args:
+            counts: Tensor of shape (batch, 5^k) or (5^k,) with k-mer counts
+            top_k: Number of top k-mers to return
+            exclude_n: If True, exclude k-mers containing N's from results
+        
+        Returns:
+            List of tuples (k-mer_string, count) for each batch element
+        """
+        if counts.dim() == 1:
+            counts = counts.unsqueeze(0)
+        
+        batch_size = counts.shape[0]
+        results = []
+        
+        for b in range(batch_size):
+            seq_counts = counts[b].clone()
+            
+            if exclude_n:
+                # Zero out counts for k-mers with N's
+                seq_counts[self.n_mask] = 0
+            
+            # Get top k indices and their counts
+            top_counts, top_indices = torch.topk(seq_counts, min(top_k, seq_counts.shape[0]))
+            
+            # Convert to list of (k-mer, count) tuples
+            batch_results = []
+            for idx, count in zip(top_indices.cpu().numpy(), top_counts.cpu().numpy()):
+                if count > 0:  # Only include k-mers with non-zero counts
+                    batch_results.append((self.kmer_to_sequence(idx), int(count)))
+            
+            results.append(batch_results)
+        
+        return results[0] if len(results) == 1 else results
+
+class ProportionalMultiDatasetSampler:
+    """
+    Samples batches from multiple datasets with probability proportional to dataset size.
+    Larger datasets get selected more often for batching.
+    """
+    
+    def __init__(self, 
+                 datasets: List[TensorDataset], 
+                 batch_size: int, 
+                 shuffle: bool = True,
+                 drop_last: bool = False):
+        """
+        Args:
+            datasets: List of TensorDatasets
+            batch_size: Same batch size for all datasets
+            shuffle: Whether to shuffle each dataset
+            drop_last: Whether to drop incomplete batches
+        """
+        self.datasets = datasets
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        
+        # Calculate dataset sizes and sampling probabilities
+        self.dataset_sizes = [len(dataset) for dataset in datasets]
+        total_size = sum(self.dataset_sizes)
+        self.sampling_probs = [size / total_size for size in self.dataset_sizes]
+        
+        # Create DataLoaders for each dataset
+        self.dataloaders = [
+            DataLoader(
+                dataset, 
+                batch_size=batch_size, 
+                shuffle=shuffle, 
+                drop_last=drop_last
+            ) for dataset in datasets
+        ]
+        
+        # Create iterators
+        self.iterators = [iter(dataloader) for dataloader in self.dataloaders]
+        
+    def __iter__(self) -> Iterator[Tuple[torch.Tensor, ...]]:
+        """
+        Yields batches by randomly selecting datasets proportional to their size.
+        """
+        # Reset iterators
+        self.iterators = [iter(dataloader) for dataloader in self.dataloaders]
+        
+        # Track which datasets are exhausted
+        active_datasets = list(range(len(self.datasets)))
+        active_probs = self.sampling_probs.copy()
+        
+        while active_datasets:
+            # Normalize probabilities for remaining active datasets
+            total_prob = sum(active_probs[i] for i in active_datasets)
+            if total_prob == 0:
+                break
+                
+            normalized_probs = [active_probs[i] / total_prob for i in active_datasets]
+            
+            # Sample a dataset proportional to its size
+            dataset_idx = np.random.choice(active_datasets, p=normalized_probs)
+            
+            try:
+                # Get next batch from selected dataset
+                batch = next(self.iterators[dataset_idx])
+                yield batch, dataset_idx
+                
+            except StopIteration:
+                # Dataset exhausted, remove from active list
+                active_datasets.remove(dataset_idx)
+                # Reset iterator for this dataset (for next epoch)
+                self.iterators[dataset_idx] = iter(self.dataloaders[dataset_idx])

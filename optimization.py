@@ -6,7 +6,6 @@ from typing import List, Tuple, Optional, Dict
 from matplotlib import pyplot as plt
 
 from utils import *
-from optimus import *
 from models import *
 
 from Bio.Data.CodonTable import standard_dna_table
@@ -19,11 +18,17 @@ class OptimizationConfig:
     seq_length: int = 100
     alt_start_pos: int = 50 #This would be the 0-based position index for A in ATG
     start_codon: Union[str, list] = 'ATG'
+
+    # Loss weights
+    w_mrl: float = 1.0
+    w_prot: float = 1.0
+    w_edit: float = 0.01
     
     # Gradient optimization parameters
     min_steps: int = 1000 #Minimum GD steps
     max_steps: int = 1000 #Maximum GD steps; must be >min_steps; it keeps iterating up to max_steps or until protein constraints are met
     max_fix_aa_grad_norm_factor: float = 0.5 #Clips fixed protein sequence constraint gradient to this factor times the grad norm of MRL loss
+    max_fix_edit_grad_norm_factor: float = 0.5 #Clips edit gradient to this factor times the grad norm of MRL loss
     learning_rate: float = 0.001 #Optimizer configs; AdamW
     beta1: float = 0.9
     beta2: float = 0.999
@@ -31,6 +36,7 @@ class OptimizationConfig:
     
     # Simulated annealing parameters; but should operate as greedy by setting max_mutations=1 and tau0=0+eps
     sa_steps: int = 2000
+    early_stop_patience: int = 500
     max_mutations: int = 1
     min_temp: float = 1e-8
     anneal_rate: float = 1e-8
@@ -103,13 +109,14 @@ class OptimizationResult:
             ]
     
     def add_history(self, mrl1: torch.Tensor, mrl2: torch.Tensor, 
-                   loss_prot: torch.Tensor, num_diff: torch.Tensor):
+                   loss_prot: torch.Tensor, num_diff: torch.Tensor, loss_edit: torch.Tensor):
         """Add a step to the history"""
         self.history.append([
             mrl1.detach().clone(),
             mrl2.detach().clone(),
             loss_prot.detach().clone(),
-            num_diff.detach().clone()
+            num_diff.detach().clone(),
+            loss_edit.detach().clone()
         ])
     
     def filter_acceptable(self):
@@ -145,9 +152,17 @@ class LossCalculator:
     def calculate_protein_loss(fix_aa: torch.Tensor, prot: torch.Tensor, 
                                eps: float = 1e-8) -> torch.Tensor:
         """Calculate protein constraint loss"""
-        return (-1.0 * torch.sum(fix_aa * torch.log(prot + eps), dim=-1)).mean(-1) #Cross entropy vs fixed target
+        return (-1.0 * torch.sum(fix_aa * torch.log(prot + eps), dim=1)).mean(-1) #Cross entropy
 
-
+    @staticmethod
+    def calculate_edit_loss(seed_seq: torch.Tensor, seq: torch.Tensor,
+                            eps: float = 1e-8) -> torch.Tensor:
+        """Calculate edit loss"""
+        l1 = F.smooth_l1_loss(seq, seed_seq, reduction='none').sum(1)
+        mask = torch.all(seed_seq == 0, dim=1)
+        l1[mask] = 0
+        return l1.mean(1) #% identity
+        
 class GradientOptimizer:
     """Handles gradient-based optimization phase"""
     
@@ -160,9 +175,7 @@ class GradientOptimizer:
     def _create_optimizer(self) -> torch.optim.Optimizer:
         """Create the optimizer for the model"""
         opt_params = (
-            list(self.model.dense.parameters()) + 
-            list(self.model.layer_norm_left.parameters()) + 
-            list(self.model.layer_norm_right.parameters())
+            list(self.model.parameters())
         )
         
         return torch.optim.AdamW(
@@ -175,7 +188,7 @@ class GradientOptimizer:
     @staticmethod
     @contextmanager
     def masked_gradients(
-        parameter: torch.Tensor, 
+        param: torch.Tensor, 
         mask: torch.Tensor
     ) -> None:
         """
@@ -186,16 +199,16 @@ class GradientOptimizer:
             mask: mask, True is selected subset of gradient
         """
         try:
-            original_grad = parameter.grad.data[~mask].clone() # Store original gradients for masked-out regions
-            parameter.grad.data[~mask] = 0.0
+            original_grad = param[~mask].clone() # Store original gradients for masked-out regions
+            param[~mask] = 0.0
             yield
                 
         finally:
-            parameter.grad.data[~mask] = original_grad # Restore original gradients for masked-out regions
+            param[~mask] = original_grad # Restore original gradients for masked-out regions
 
     @staticmethod
     def clip_grad_norm_masked(
-        parameter: torch.Tensor,
+        param: torch.Tensor,
         max_norm: float,
         mask: torch.Tensor,
         norm_type: float = 2.0,
@@ -212,9 +225,9 @@ class GradientOptimizer:
         Returns:
             Total norm of gradients before clipping
         """
-        with GradientOptimizer.masked_gradients(parameter, mask):
+        with GradientOptimizer.masked_gradients(param, mask):
             return torch.nn.utils.clip_grad_norm_(
-                parameter, max_norm, norm_type
+                param, max_norm, norm_type
             )
 
     @staticmethod
@@ -249,47 +262,47 @@ class GradientOptimizer:
                 threshold = torch.kthvalue(grad_magnitudes, k).values
                 mask = grad_magnitudes > threshold
                 layer.bias.grad[batch_index] = grad * mask.float()
-    
-    def _compute_gradients(self, loss_mrl: torch.Tensor, loss_prot: torch.Tensor) -> Dict:
+                
+    def _backward_and_save(
+        self, 
+        loss: torch.Tensor, 
+        retain: Optional[bool] = True
+    ):
+        """Get gradient and save"""
+        loss.backward(retain_graph=retain)
+        per_batch_weight_grad_norm = self.model.weight.grad.data.flatten(1).norm(p=2, dim=1) 
+        return self.model.weight.grad.data.detach().clone(), per_batch_weight_grad_norm
+
+    def _clip_grad_per_batch(
+        self, 
+        grad: torch.Tensor, 
+        grad_norm: torch.Tensor, 
+        factor: Optional[float] = 1.0, 
+    ):
+        """Clip gradient per batch"""
+        max_grad_norm = factor * grad_norm
+        total_norm = grad.norm(dim=(1,2)).view(-1, 1, 1)
+        return grad * max_grad_norm / (total_norm + self.config.eps)
+        
+        
+    def _compute_gradients(self, loss_mrl: torch.Tensor, loss_prot: torch.Tensor, loss_edit: torch.Tensor) -> Dict:
         """Compute and scale gradients"""
-        # Store MRL gradients
-        grads_mrl = {
-            name: torch.zeros_like(param) 
-            for name, param in self.model.named_parameters()
-        }
-        
-        # Compute MRL gradients
+        # Compute and store MRL gradients
         self.optimizer.zero_grad()
-        loss_mrl.sum().backward(retain_graph=True)
-        
-        mrl_grad_norm = self.model.dense.weight.grad.data.view( #Grad norm of the MRL to scale by
-            (self.model.num_batch, self.model.onehot_dim, self.model.seq_length)
-        ).flatten(1).norm(p=2, dim=1) 
-        
-        for name, param in self.model.named_parameters(): #Save the MRL gradient
-            if param.grad is not None:
-                grads_mrl[name] += param.grad.clone()
+        grads_mrl, mrl_grad_norm = self._backward_and_save(loss_mrl.sum(), True)
         
         self.optimizer.zero_grad() #Clear the gradient to calculate protein gradient separately
-        loss_prot.sum().backward()
-        
-        mask = torch.zeros(self.model.dense.weight.shape, dtype=torch.bool, 
-                          device=self.model.dense.weight.device)
-        
-        for b in range(self.model.num_batch): #Scaling for each batch independently
-            max_grad_norm = self.config.max_fix_aa_grad_norm_factor * mrl_grad_norm[b] #Scales protein grad norm to MRL grad norm
-            start_idx = b * self.model.onehot_dim * self.model.seq_length
-            end_idx = (b + 1) * self.model.onehot_dim * self.model.seq_length
-            
-            mask[start_idx:end_idx].fill_(True)
-            GradientOptimizer.clip_grad_norm_masked(self.model.dense.weight, max_grad_norm, mask)
-            mask[start_idx:end_idx].fill_(False)
+        grads_prot, prot_grad_norm = self._backward_and_save(loss_prot.sum(), True)
+        grads_prot = self._clip_grad_per_batch(grads_prot, mrl_grad_norm, self.config.max_fix_aa_grad_norm_factor)
 
-        for name, param in self.model.named_parameters(): #Accumulate back the saved MRL gradient atop protein gradient
-            if param.grad is not None:
-                param.grad += grads_mrl[name]
+        self.optimizer.zero_grad()
+        grads_edit, edit_grad_norm = self._backward_and_save(loss_edit.sum(), False)
+        grads_edit = self._clip_grad_per_batch(grads_edit, mrl_grad_norm, self.config.max_fix_edit_grad_norm_factor)
+
+        self.optimizer.zero_grad()
+        return grads_mrl, grads_prot, grads_edit
         
-    def optimize(self, fix_aa: torch.Tensor) -> OptimizationResult:
+    def optimize(self, fix_aa: torch.Tensor, seed_onehot: torch.Tensor) -> OptimizationResult:
         """Run gradient-based optimization"""
         result = OptimizationResult()
         result.min_losses = [float('inf')] * self.config.n_batch
@@ -308,11 +321,19 @@ class GradientOptimizer:
             sampled, mrl1, mrl2, prot = self.model() # Forward pass
             
             # Calculate losses
-            loss_mrl = self.loss_calc.calculate_mrl_loss(mrl1, mrl2)
-            loss_prot = self.loss_calc.calculate_protein_loss(fix_aa, prot, self.config.eps)
+            _loss_mrl = self.loss_calc.calculate_mrl_loss(mrl1, mrl2)
+            _loss_prot = self.loss_calc.calculate_protein_loss(fix_aa, prot, self.config.eps)
+            if seed_onehot is None:
+                seed_onehot = sampled.detach().clone()
+            _loss_edit = self.loss_calc.calculate_edit_loss(seed_onehot, sampled, self.config.eps)
             
+            loss_mrl = self.config.w_mrl * _loss_mrl
+            loss_prot = self.config.w_prot * _loss_prot
+            loss_edit = self.config.w_edit * _loss_edit
+
             # Compute and apply gradients
-            self._compute_gradients(loss_mrl, loss_prot)
+            grads_mrl, grads_prot, grads_edit = self._compute_gradients(loss_mrl, loss_prot, loss_edit)
+            self.model.weight.grad = grads_mrl + grads_prot + grads_edit #Accumulate back the saved MRL gradient atop protein gradient
             self.optimizer.step()
             
             # Track changes
@@ -330,7 +351,7 @@ class GradientOptimizer:
                 found_result = True
             
             # Add to history
-            result.add_history(mrl1, mrl2, loss_prot, num_diff)
+            result.add_history(mrl1, mrl2, _loss_prot, num_diff, _loss_edit)
             
             step += 1
             if step >= self.config.max_steps:
@@ -449,8 +470,8 @@ class SimulatedAnnealer:
         
         return tensor
 
-    def anneal(self, result: OptimizationResult, fix_aa: torch.Tensor, 
-              initial_step: int = 0) -> OptimizationResult:
+    def optimize(self, result: OptimizationResult, fix_aa: torch.Tensor, 
+              initial_step: int = 0, seed_onehot: Optional[torch.Tensor] = None) -> OptimizationResult:
         """Run simulated annealing on the best results"""
         if not result.best_results:
             return result
@@ -460,9 +481,18 @@ class SimulatedAnnealer:
         
         with torch.inference_mode():
             sampled, mrl1, mrl2, prot = self.model(input_onehot=current_input)
-            loss_mrl = self.loss_calc.calculate_mrl_loss(mrl1, mrl2)
-            loss_prot = self.loss_calc.calculate_protein_loss(fix_aa, prot, self.config.eps)
-            loss_total = loss_mrl + loss_prot
+
+            _loss_mrl = self.loss_calc.calculate_mrl_loss(mrl1, mrl2)
+            _loss_prot = self.loss_calc.calculate_protein_loss(fix_aa, prot, self.config.eps)
+            if seed_onehot is None:
+                seed_onehot = sampled.detach().clone()
+            _loss_edit = self.loss_calc.calculate_edit_loss(seed_onehot, sampled, self.config.eps)
+            
+            loss_mrl = self.config.w_mrl * _loss_mrl
+            loss_prot = self.config.w_prot * _loss_prot
+            loss_edit = self.config.w_edit * _loss_edit
+
+            loss_total = loss_mrl + loss_prot + loss_edit
             prev_sample = sampled.detach().clone()
             
             last_loss_prot = loss_prot.detach().clone()
@@ -481,9 +511,18 @@ class SimulatedAnnealer:
                 
                 # Calculate new losses
                 sampled, mrl1, mrl2, prot = self.model(input_onehot=current_input)
-                loss_mrl = self.loss_calc.calculate_mrl_loss(mrl1, mrl2)
-                loss_prot = self.loss_calc.calculate_protein_loss(fix_aa, prot, self.config.eps)
-                loss_total = loss_mrl + loss_prot
+
+                _loss_mrl = self.loss_calc.calculate_mrl_loss(mrl1, mrl2)
+                _loss_prot = self.loss_calc.calculate_protein_loss(fix_aa, prot, self.config.eps)
+                if seed_onehot is None:
+                    seed_onehot = sampled.detach().clone()
+                _loss_edit = self.loss_calc.calculate_edit_loss(seed_onehot, sampled, self.config.eps)
+                
+                loss_mrl = self.config.w_mrl * _loss_mrl
+                loss_prot = self.config.w_prot * _loss_prot
+                loss_edit = self.config.w_edit * _loss_edit
+            
+                loss_total = loss_mrl + loss_prot + loss_edit
                 
                 # Annealing decisions
                 tau = self._calculate_temperature(sa_step)
@@ -510,7 +549,7 @@ class SimulatedAnnealer:
                 prev_sample = sampled.detach().clone()
                 
                 # Add to history
-                result.add_history(mrl1, mrl2, loss_prot, num_diff)
+                result.add_history(mrl1, mrl2, _loss_prot, num_diff, _loss_edit)
         
         return result
 
@@ -650,7 +689,7 @@ class OptimusOLGPipeline:
         else:
             self.start_codon = dna_to_onehot(self.config.start_codon, 3).transpose(1, 0)
             
-    def run(self, fix_aa: torch.Tensor = None, right_overhang_mask: torch.Tensor = None) -> OptimizationResult:
+    def run(self, fix_aa: torch.Tensor = None, right_overhang_mask: torch.Tensor = None, seed_onehot: Optional[torch.Tensor] = None) -> OptimizationResult:
         """Run the complete optimization pipeline"""       
         # Phase 1: Gradient-based optimization
         print("Starting gradient-based optimization...")
@@ -658,11 +697,11 @@ class OptimusOLGPipeline:
             self.device, self.model_mrl, self.translator, 
             self.config.n_batch, self.config.seq_length, 
             self.config.alt_start_pos, self.start_codon, 
-            right_overhang_mask
+            right_overhang_mask, seed_onehot
         ).to(self.device)
         
         grad_optimizer = GradientOptimizer(model, self.config)
-        result = grad_optimizer.optimize(fix_aa)
+        result = grad_optimizer.optimize(fix_aa, seed_onehot)
         
         # Filter acceptable results
         result.filter_acceptable()
@@ -677,14 +716,15 @@ class OptimusOLGPipeline:
             self.device, self.model_mrl, self.translator, 
             len(result.best_results), self.config.seq_length, 
             self.config.alt_start_pos, self.start_codon, 
-            right_overhang_mask
+            right_overhang_mask, seed_onehot
         ).to(self.device)
         
         annealer = SimulatedAnnealer(model, self.config)
-        result = annealer.anneal(
+        result = annealer.optimize(
             result, 
             fix_aa[result.acceptable_batch], 
-            self.config.max_steps
+            self.config.max_steps,
+            seed_onehot
         )
         
         print(f"Optimization complete. Found {len(result.best_results)} optimized sequences.")
@@ -698,7 +738,7 @@ class OptimusOLGPipeline:
         
         history = torch.stack([torch.stack(h) for h in result.history])
         
-        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        fig, axes = plt.subplots(3, 2, figsize=(12, 10))
         
         # Plot MRL1
         axes[0, 0].plot(history[:, 0].cpu().numpy())
@@ -723,6 +763,12 @@ class OptimusOLGPipeline:
         axes[1, 1].set_title('Sequence Changes over iterations')
         axes[1, 1].set_xlabel('Iteration')
         axes[1, 1].set_ylabel('Number of differences')
+
+        # Plot Edit Loss
+        axes[2, 0].plot(history[:, 4].cpu().numpy())
+        axes[2, 0].set_title('Edit Loss over iterations')
+        axes[2, 0].set_xlabel('Iteration')
+        axes[2, 0].set_ylabel('Edit Loss')
         
         plt.tight_layout()
         plt.show()
