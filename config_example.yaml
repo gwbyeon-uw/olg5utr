@@ -1,0 +1,17 @@
+# Experiment: 50nt sequence, +1 frame, protein MAP, overhang TC
+#
+# Usage:
+#   from olg5utr import BASE_CONFIG_PATH, OptimizationConfig
+#   config = OptimizationConfig.from_yaml(BASE_CONFIG_PATH, "config_example.yaml")
+#
+# Frame math:
+#   alt_start_pos=39, 39 % 3 = 0 → same reading frame
+#   Start codon ATG (M) at positions 39-41, then AP at 42-47
+#   aa_len = (50 - 39) // 3 - 1 = 2 → matches len("AP")
+#   Sequence is left-padded to 100nt for Optimus model input
+
+seq_length: 50
+alt_start_pos: 39
+fix_aa_seq: AP
+right_overhang: TC
+n_batch: 50

@@ -1,31 +1,31 @@
-import torch
-import torch.nn.functional as F
-from torch.utils.data import TensorDataset, DataLoader
+from collections.abc import Iterator
+from typing import Literal
 
 import numpy as np
-
-from typing import List, Iterator, Tuple, Optional, Union, Literal
-
-from olg5utr.encoding import DNA_ALPHABET
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
 
 
 def quantile_normalize_binned(
     values: torch.Tensor,
     bin_variable: torch.Tensor,
-    n_bins: int = 10
+    n_bins: int = 10,
 ) -> torch.Tensor:
-    """
-    Quantile normalization that replaces ranks with averaged values at each rank.
-    Each rank position gets the average value of all samples at that rank across all bins.
+    """Quantile normalization that replaces ranks with averaged values at each rank.
+
+    Each rank position gets the average value of all samples at that rank
+    across all bins.
 
     Args:
         values: 1D tensor of values to be normalized.
-        bin_variable: 1D tensor used to define bins for stratified normalization. Should have the same length as values.
+        bin_variable: 1D tensor used to define bins for stratified normalization.
+            Must have the same length as values.
         n_bins: Number of bins to create based on quantiles of bin_variable.
 
     Returns:
-        torch.Tensor: Normalized values with the same shape and device as input values.
-                     Values are replaced with averaged quantile values computed across all bins.
+        Normalized values with the same shape and device as input. Values are
+        replaced with averaged quantile values computed across all bins.
     """
     device = values.device
 
@@ -64,23 +64,20 @@ def quantile_normalize_binned(
     all_percentiles_cat = torch.cat(all_percentiles)
 
     # Create a grid of target percentiles for interpolation
-    n_quantiles = 100  # Use 100 quantiles for smooth interpolation
+    n_quantiles = 100
     target_percentiles = torch.linspace(0, 1, n_quantiles, device=device)
 
     # For each target percentile, find the average value
     quantile_averages = torch.zeros(n_quantiles, device=device)
 
     for i, target_p in enumerate(target_percentiles):
-        # Find values close to this percentile (within a small window)
         window = 0.02  # 2% window
         mask = torch.abs(all_percentiles_cat - target_p) <= window
 
         if mask.sum() > 0:
             quantile_averages[i] = all_values_cat[mask].mean()
-        else:
-            # If no values in window, interpolate from nearest values
-            if i > 0:
-                quantile_averages[i] = quantile_averages[i-1]
+        elif i > 0:
+            quantile_averages[i] = quantile_averages[i - 1]
 
     # Handle any remaining zeros by forward/backward fill
     non_zero_mask = quantile_averages != 0
@@ -88,10 +85,8 @@ def quantile_normalize_binned(
         first_non_zero = non_zero_mask.nonzero()[0].item()
         last_non_zero = non_zero_mask.nonzero()[-1].item()
 
-        # Forward fill before first non-zero
         quantile_averages[:first_non_zero] = quantile_averages[first_non_zero]
-        # Backward fill after last non-zero
-        quantile_averages[last_non_zero+1:] = quantile_averages[last_non_zero]
+        quantile_averages[last_non_zero + 1 :] = quantile_averages[last_non_zero]
 
     # Second pass: assign averaged values based on percentile positions
     normalized_values = torch.zeros_like(values)
@@ -100,88 +95,100 @@ def quantile_normalize_binned(
         mask = bin_indices == bin_idx
         if mask.sum() == 0:
             continue
-        elif mask.sum() == 1:
-            # Single value bin - assign middle quantile
+        if mask.sum() == 1:
             normalized_values[mask] = quantile_averages[n_quantiles // 2]
             continue
 
         bin_values = values[mask]
         bin_size = len(bin_values)
 
-        # Get percentile positions
         ranks = torch.argsort(torch.argsort(bin_values)).float()
         percentiles = ranks / (bin_size - 1)
 
-        # Map percentiles to quantile indices
         quantile_indices = (percentiles * (n_quantiles - 1)).round().long()
         quantile_indices = torch.clamp(quantile_indices, 0, n_quantiles - 1)
 
-        # Assign averaged values
         normalized_values[mask] = quantile_averages[quantile_indices]
 
     return normalized_values
 
 
 def scaler(rl: torch.Tensor) -> torch.Tensor:
-    """Z-score normalization"""
-    m = rl.mean()
-    s = rl.std()
-    scaled_rl = rl - m
-    scaled_rl = scaled_rl / s
-    return scaled_rl
+    """Z-score normalization.
+
+    Args:
+        rl: 1D tensor of values to normalize.
+
+    Returns:
+        Z-score normalized tensor (zero mean, unit variance).
+    """
+    return (rl - rl.mean()) / rl.std()
 
 
 def euc_distance_min(
     counts1: torch.Tensor,
     counts2: torch.Tensor,
-    chunk_size: Optional[int] = None
+    chunk_size: int | None = None,
 ) -> torch.Tensor:
-    """
+    """Compute minimum L2 distance from each point in counts1 to counts2.
+
+    Both tensors are L2-normalized before computing distances.
+
     Args:
-        counts1: 2D tensor of shape (N, D)
-        counts2: 2D tensor of shape (M, D); must have the same feature dimension D as counts1.
-        chunk_size: batch size for processing counts1 in chunks to manage memory.
+        counts1: 2D tensor of shape ``(N, D)``.
+        counts2: 2D tensor of shape ``(M, D)``. Must have the same feature
+            dimension D as counts1.
+        chunk_size: Batch size for processing counts1 in chunks to manage
+            memory.
 
     Returns:
-        torch.Tensor: 1D tensor of shape (N,) containing the minimum distance from each point in counts1 to any point in counts2.
+        1D tensor of shape ``(N,)`` with minimum distances.
     """
     normalized1 = F.normalize(counts1.to(torch.float32), p=2, dim=1)
     normalized2 = F.normalize(counts2.to(torch.float32), p=2, dim=1)
 
-    return torch.cat([ torch.cdist(normalized1[i:(i+chunk_size)], normalized2).min(1).values for i in range(0, normalized1.shape[0], chunk_size) ])
+    return torch.cat(
+        [
+            torch.cdist(normalized1[i : (i + chunk_size)], normalized2).min(1).values
+            for i in range(0, normalized1.shape[0], chunk_size)
+        ]
+    )
 
 
 def select_onehot_by_priority(
     onehot_tensor: torch.Tensor,
     priority_vector: torch.Tensor,
-    select_mode: Literal['max', 'min'] = 'max'
+    select_mode: Literal["max", "min"] = "max",
 ) -> torch.Tensor:
-    """
-    Select one representative index for each unique one-hot pattern based on priority values for deduplication
+    """Select one representative per unique one-hot pattern by priority.
+
+    Used for deduplication: keeps only the highest (or lowest) priority
+    sample for each unique pattern.
 
     Args:
-        onehot_tensor: 2D tensor of shape (N, D); i.e. one-hot DNA
-        priority_vector: 1D tensor of shape (N,) containing priority scores for each sample.
-        select_mode: Selection criterion for choosing the best priority.
+        onehot_tensor: 2D tensor of shape ``(N, D)`` (e.g., one-hot DNA).
+        priority_vector: 1D tensor of shape ``(N,)`` with priority scores.
+        select_mode: ``'max'`` to keep highest priority, ``'min'`` for lowest.
 
     Returns:
-        torch.Tensor: 1D tensor of dtype long containing the original indices of selected samples.
-                     Length equals the number of unique patterns found in onehot_tensor.
-                     Indices are sorted by the order of first appearance of each unique pattern.
+        1D long tensor of selected original indices. Length equals the number
+        of unique patterns. Sorted by order of first appearance.
     """
     unique_patterns, inverse_indices = torch.unique(onehot_tensor, dim=0, return_inverse=True)
     num_unique = unique_patterns.size(0)
 
-    best_priorities = torch.zeros(num_unique, dtype=priority_vector.dtype, device=priority_vector.device)
-    if select_mode == 'max':
-        best_priorities.fill_(-float('inf'))
-        best_priorities.scatter_reduce_(0, inverse_indices, priority_vector, reduce='amax')
-    else:  # min
-        best_priorities.fill_(float('inf'))
-        best_priorities.scatter_reduce_(0, inverse_indices, priority_vector, reduce='amin')
+    best_priorities = torch.zeros(
+        num_unique, dtype=priority_vector.dtype, device=priority_vector.device
+    )
+    if select_mode == "max":
+        best_priorities.fill_(-float("inf"))
+        best_priorities.scatter_reduce_(0, inverse_indices, priority_vector, reduce="amax")
+    else:
+        best_priorities.fill_(float("inf"))
+        best_priorities.scatter_reduce_(0, inverse_indices, priority_vector, reduce="amin")
 
     target_priorities = best_priorities[inverse_indices]
-    is_selected = (priority_vector == target_priorities)
+    is_selected = priority_vector == target_priorities
 
     selected_indices = torch.zeros(num_unique, dtype=torch.long, device=onehot_tensor.device)
     for unique_idx in range(num_unique):
@@ -198,25 +205,24 @@ def stratified_split(
     tr: torch.Tensor,
     kmers: torch.Tensor,
     fraction: float = 0.2,
-    rand_split: bool = False
-) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-    """
-    Perform stratified train/test split based on sequence lengths, preserving length distribution.
+    rand_split: bool = False,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Stratified train/test split preserving sequence length distribution.
 
     Args:
-        seq: 3D tensor representing sequences, (B, C, L)
-        rl: MRL values, (N,)
-        tr: priority (total read count), (N, )
-        kmers: pass-thru for kmer counts
-        fraction: fraction of data for split
-        rand_split: If True, randomly split within each length stratum. Else, priortize by tr
+        seq: 3D tensor of sequences ``(N, C, L)``.
+        rl: 1D tensor of MRL values ``(N,)``.
+        tr: 1D tensor of total read counts (priority) ``(N,)``.
+        kmers: K-mer count tensor (passed through).
+        fraction: Fraction of data for the test split.
+        rand_split: If True, randomly split within each length stratum.
+            Otherwise, prioritize by ``tr`` (highest counts go to test).
 
     Returns:
-        Tuple containing two lists:
-        - train_data: List of 5 tensors [seq_train, rl_train, rl_train_scaled, tr_train, kmers_train]
-        - test_data: List of 5 tensors [seq_test, rl_test, rl_test_scaled, tr_test, kmers_test]
+        Tuple of (train_data, test_data), each a list of 5 tensors:
+        ``[seq, rl, rl_scaled, tr, kmers]``.
     """
-    lens = seq.sum([1,2]).long()
+    lens = seq.sum([1, 2]).long()
     unique_labels = torch.unique(lens).to(lens.device)
 
     train_indices = torch.tensor([], dtype=torch.long)
@@ -234,28 +240,43 @@ def stratified_split(
         train_indices = torch.cat([train_indices, shuffled_indices[n_test:]])
         test_indices = torch.cat([test_indices, shuffled_indices[:n_test]])
 
-    return [ seq[train_indices], rl[train_indices], scaler(rl[train_indices]), tr[train_indices], kmers[train_indices] ], [ seq[test_indices], rl[test_indices], scaler(rl[test_indices]), tr[test_indices], kmers[test_indices] ]
+    return (
+        [
+            seq[train_indices],
+            rl[train_indices],
+            scaler(rl[train_indices]),
+            tr[train_indices],
+            kmers[train_indices],
+        ],
+        [
+            seq[test_indices],
+            rl[test_indices],
+            scaler(rl[test_indices]),
+            tr[test_indices],
+            kmers[test_indices],
+        ],
+    )
 
 
 def bin_2d_by_quantiles(
     values: torch.Tensor,
     assignment_vector: torch.Tensor,
-    num_bins: int = 10
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Bin 2D values based on quantiles of assignment vector and calculate column averages per bin
+    num_bins: int = 10,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Bin 2D values by quantiles of an assignment vector and compute column averages.
 
     Args:
-        values: [n_samples, n_features] - 2D tensor of values
-        assignment_vector: [n_samples] - vector to determine bin assignments
-        num_bins: number of quantile bins
+        values: 2D tensor of shape ``(n_samples, n_features)``.
+        assignment_vector: 1D tensor ``(n_samples,)`` for bin assignment.
+        num_bins: Number of quantile bins.
 
     Returns:
-        bin_averages: [n_bins, n_features] - average of each column per bin
-        bin_counts: [n_bins] - number of samples in each bin
-        thresholds: [num_bins+1] - quantile thresholds used for binning
+        Tuple of:
+            - bin_averages: ``(n_bins, n_features)`` average per column per bin.
+            - bin_counts: ``(n_bins,)`` number of samples per bin.
+            - thresholds: ``(num_bins + 1,)`` quantile thresholds used.
     """
-    n_samples, n_features = values.shape
+    _n_samples, n_features = values.shape
 
     quantiles = torch.linspace(0, 1, num_bins + 1)
     thresholds = torch.quantile(assignment_vector, quantiles)
@@ -275,32 +296,42 @@ def bin_2d_by_quantiles(
     bin_averages = torch.where(
         bin_counts.unsqueeze(-1) > 0,
         bin_sums / bin_counts.unsqueeze(-1),
-        torch.zeros_like(bin_sums)
+        torch.zeros_like(bin_sums),
     )
 
     return bin_averages, bin_counts, thresholds
 
 
 class KmerCounter:
-    """
-    Efficient k-mer counter for one-hot encoded DNA sequences.
-    Handles N's (all zeros) and provides option to exclude k-mers containing N's.
+    """Efficient k-mer counter for one-hot encoded DNA sequences.
+
+    Handles N's (all-zero positions) and provides an option to exclude
+    k-mers containing N's.
+
+    Args:
+        k: K-mer length.
+        device: Compute device string.
     """
 
-    def __init__(self, k: int, device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
+    def __init__(
+        self,
+        k: int,
+        device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    ) -> None:
         self.k = k
         self.device = device
-        self.vocab_size = 5 ** k  # 5 possible values: A, T, G, C, N
+        self.vocab_size = 5**k  # 5 values: A, T, G, C, N
 
-        self.powers = torch.tensor([5 ** i for i in range(k-1, -1, -1)],
-                                   dtype=torch.long, device=device)
+        self.powers = torch.tensor(
+            [5**i for i in range(k - 1, -1, -1)],
+            dtype=torch.long,
+            device=device,
+        )
 
         self._create_n_mask()
 
-    def _create_n_mask(self):
-        """Create a mask to identify which k-mer indices contain N's."""
-        all_kmers = torch.arange(self.vocab_size, device=self.device)
-
+    def _create_n_mask(self) -> None:
+        """Create a boolean mask identifying k-mer indices that contain N's."""
         has_n = torch.zeros(self.vocab_size, dtype=torch.bool, device=self.device)
 
         for idx in range(self.vocab_size):
@@ -314,71 +345,60 @@ class KmerCounter:
         self.n_mask = has_n
 
     def one_hot_to_indices(self, one_hot: torch.Tensor) -> torch.Tensor:
-        """
-        Convert one-hot encoded sequences to base-5 indices.
+        """Convert one-hot encoded sequences to base-5 indices.
 
         Args:
-            one_hot: Tensor of shape (batch, 4, length) or (4, length)
+            one_hot: Tensor of shape ``(batch, 4, length)`` or ``(4, length)``.
 
         Returns:
-            Tensor of indices where A=0, T=1, G=2, C=3, N=4
+            Index tensor where A=0, T=1, G=2, C=3, N=4.
         """
-        indices = torch.argmax(one_hot, dim=-2 if one_hot.dim() == 3 else 0)
-
-        is_n = (one_hot.sum(dim=-2 if one_hot.dim() == 3 else 0) == 0)
-
+        dim = -2 if one_hot.dim() == 3 else 0
+        indices = torch.argmax(one_hot, dim=dim)
+        is_n = one_hot.sum(dim=dim) == 0
         indices[is_n] = 4
-
         return indices
 
     def extract_kmers(self, sequences: torch.Tensor) -> torch.Tensor:
-        """
-        Extract all k-mers from sequences using sliding window.
+        """Extract all k-mers from sequences using a sliding window.
 
         Args:
-            sequences: Tensor of shape (batch, 4, length) with one-hot encoding
+            sequences: One-hot tensor of shape ``(batch, 4, length)``.
 
         Returns:
-            Tensor of k-mer indices of shape (batch, num_kmers)
+            K-mer index tensor of shape ``(batch, num_kmers)``.
         """
-        batch_size, _, seq_len = sequences.shape
-        num_kmers = seq_len - self.k + 1
+        indices = self.one_hot_to_indices(sequences)
+        kmers = indices.unfold(dimension=1, size=self.k, step=1)
+        return (kmers * self.powers).sum(dim=-1)
 
-        indices = self.one_hot_to_indices(sequences)  # (batch, length)
-
-        kmers = indices.unfold(dimension=1, size=self.k, step=1)  # (batch, num_kmers, k)
-
-        kmer_indices = (kmers * self.powers).sum(dim=-1)  # (batch, num_kmers)
-
-        return kmer_indices
-
-    def count_kmers(self,
-                   sequences: torch.Tensor,
-                   exclude_n: bool = False,
-                   return_dense: bool = True) -> torch.Tensor:
-        """
-        Count k-mers in batch of sequences.
+    def count_kmers(
+        self,
+        sequences: torch.Tensor,
+        exclude_n: bool = False,
+        return_dense: bool = True,
+    ) -> torch.Tensor:
+        """Count k-mers in a batch of sequences.
 
         Args:
-            sequences: Tensor of shape (batch, 4, length) with one-hot encoding
-            exclude_n: If True, exclude k-mers containing N's from counts
-            return_dense: If True, return dense count matrix; if False, return sparse
+            sequences: One-hot tensor of shape ``(batch, 4, length)``.
+            exclude_n: If True, exclude k-mers containing N's from counts.
+            return_dense: If True, return dense count matrix. Otherwise
+                return a sparse COO tensor.
 
         Returns:
-            If return_dense: Tensor of shape (batch, 5^k) with k-mer counts
-            If not return_dense: Tuple of (indices, values, shape) for sparse tensor
+            Dense tensor of shape ``(batch, 5^k)`` with k-mer counts, or
+            a sparse COO tensor with the same logical shape.
         """
         batch_size = sequences.shape[0]
-
-        kmer_indices = self.extract_kmers(sequences)  # (batch, num_kmers)
+        kmer_indices = self.extract_kmers(sequences)
 
         if exclude_n:
             mask = ~self.n_mask[kmer_indices]
             kmer_indices = kmer_indices * mask - 1
 
         if return_dense:
-            counts = torch.zeros(batch_size, self.vocab_size,
-                                dtype=torch.long, device=self.device)
+            counts = torch.zeros(batch_size, self.vocab_size, dtype=torch.long, device=self.device)
 
             for b in range(batch_size):
                 seq_kmers = kmer_indices[b]
@@ -390,50 +410,50 @@ class KmerCounter:
                     counts[b] = bincount
 
             return counts
-        else:
-            all_indices = []
-            all_values = []
 
-            for b in range(batch_size):
-                seq_kmers = kmer_indices[b]
-                if exclude_n:
-                    seq_kmers = seq_kmers[seq_kmers >= 0]
+        all_indices = []
+        all_values = []
 
-                if seq_kmers.numel() > 0:
-                    unique_kmers, counts = torch.unique(seq_kmers, return_counts=True)
-                    batch_indices = torch.full_like(unique_kmers, b)
-                    indices = torch.stack([batch_indices, unique_kmers])
-                    all_indices.append(indices)
-                    all_values.append(counts)
+        for b in range(batch_size):
+            seq_kmers = kmer_indices[b]
+            if exclude_n:
+                seq_kmers = seq_kmers[seq_kmers >= 0]
 
-            if all_indices:
-                indices = torch.cat(all_indices, dim=1)
-                values = torch.cat(all_values)
-                return torch.sparse_coo_tensor(indices, values,
-                                              (batch_size, self.vocab_size))
-            else:
-                return torch.sparse_coo_tensor(torch.zeros(2, 0, dtype=torch.long),
-                                              torch.zeros(0, dtype=torch.long),
-                                              (batch_size, self.vocab_size))
+            if seq_kmers.numel() > 0:
+                unique_kmers, counts = torch.unique(seq_kmers, return_counts=True)
+                batch_indices = torch.full_like(unique_kmers, b)
+                indices = torch.stack([batch_indices, unique_kmers])
+                all_indices.append(indices)
+                all_values.append(counts)
 
-    def count_kmers_chunked(self,
-                           sequences: torch.Tensor,
-                           chunk_size: int = 10000,
-                           exclude_n: bool = False) -> torch.Tensor:
-        """
-        Count k-mers in very large batches using chunking for memory efficiency.
+        if all_indices:
+            indices = torch.cat(all_indices, dim=1)
+            values = torch.cat(all_values)
+            return torch.sparse_coo_tensor(indices, values, (batch_size, self.vocab_size))
+        return torch.sparse_coo_tensor(
+            torch.zeros(2, 0, dtype=torch.long),
+            torch.zeros(0, dtype=torch.long),
+            (batch_size, self.vocab_size),
+        )
+
+    def count_kmers_chunked(
+        self,
+        sequences: torch.Tensor,
+        chunk_size: int = 10000,
+        exclude_n: bool = False,
+    ) -> torch.Tensor:
+        """Count k-mers in large batches using chunking for memory efficiency.
 
         Args:
-            sequences: Tensor of shape (batch, 4, length) with one-hot encoding
-            chunk_size: Number of sequences to process at once
-            exclude_n: If True, exclude k-mers containing N's from counts
+            sequences: One-hot tensor of shape ``(batch, 4, length)``.
+            chunk_size: Number of sequences to process at once.
+            exclude_n: If True, exclude k-mers containing N's.
 
         Returns:
-            Tensor of shape (batch, 5^k) with k-mer counts
+            Dense tensor of shape ``(batch, 5^k)`` with k-mer counts.
         """
         batch_size = sequences.shape[0]
-        counts = torch.zeros(batch_size, self.vocab_size,
-                            dtype=torch.long, device=self.device)
+        counts = torch.zeros(batch_size, self.vocab_size, dtype=torch.long, device=self.device)
 
         for i in range(0, batch_size, chunk_size):
             end_idx = min(i + chunk_size, batch_size)
@@ -443,38 +463,39 @@ class KmerCounter:
         return counts
 
     def kmer_to_sequence(self, kmer_idx: int) -> str:
-        """
-        Convert k-mer index back to sequence string.
+        """Convert a k-mer index back to its sequence string.
 
         Args:
-            kmer_idx: Index of k-mer in base-5 representation
+            kmer_idx: K-mer index in base-5 representation.
 
         Returns:
-            String representation of k-mer
+            String representation of the k-mer.
         """
-        bases = ['A', 'T', 'G', 'C', 'N']
+        bases = ["A", "T", "G", "C", "N"]
         sequence = []
 
         for _ in range(self.k):
             sequence.append(bases[kmer_idx % 5])
             kmer_idx //= 5
 
-        return ''.join(reversed(sequence))
+        return "".join(reversed(sequence))
 
-    def get_top_kmers(self,
-                     counts: torch.Tensor,
-                     top_k: int = 10,
-                     exclude_n: bool = True) -> list:
-        """
-        Get top k most frequent k-mers from count matrix.
+    def get_top_kmers(
+        self,
+        counts: torch.Tensor,
+        top_k: int = 10,
+        exclude_n: bool = True,
+    ) -> list:
+        """Get the top-k most frequent k-mers from a count matrix.
 
         Args:
-            counts: Tensor of shape (batch, 5^k) or (5^k,) with k-mer counts
-            top_k: Number of top k-mers to return
-            exclude_n: If True, exclude k-mers containing N's from results
+            counts: Tensor of shape ``(batch, 5^k)`` or ``(5^k,)``.
+            top_k: Number of top k-mers to return.
+            exclude_n: If True, exclude k-mers containing N's.
 
         Returns:
-            List of tuples (k-mer_string, count) for each batch element
+            List of ``(kmer_string, count)`` tuples for each batch element.
+            Returns a flat list if input was 1D.
         """
         if counts.dim() == 1:
             counts = counts.unsqueeze(0)
@@ -491,7 +512,9 @@ class KmerCounter:
             top_counts, top_indices = torch.topk(seq_counts, min(top_k, seq_counts.shape[0]))
 
             batch_results = []
-            for idx, count in zip(top_indices.cpu().numpy(), top_counts.cpu().numpy()):
+            for idx, count in zip(
+                top_indices.cpu().numpy(), top_counts.cpu().numpy(), strict=False
+            ):
                 if count > 0:
                     batch_results.append((self.kmer_to_sequence(idx), int(count)))
 
@@ -501,16 +524,26 @@ class KmerCounter:
 
 
 class ProportionalMultiDatasetSampler:
-    """
-    Samples batches from multiple datasets with probability proportional to dataset size.
-    Larger datasets get selected more often for batching.
+    """Samples batches from multiple datasets proportional to dataset size.
+
+    Larger datasets get selected more often for batching. When a dataset
+    is exhausted, it is removed from the active pool and sampling continues
+    with the remaining datasets.
+
+    Args:
+        datasets: List of TensorDataset instances.
+        batch_size: Batch size for each DataLoader.
+        shuffle: Whether to shuffle within each DataLoader.
+        drop_last: Whether to drop incomplete last batches.
     """
 
-    def __init__(self,
-                 datasets: List[TensorDataset],
-                 batch_size: int,
-                 shuffle: bool = True,
-                 drop_last: bool = False):
+    def __init__(
+        self,
+        datasets: list[TensorDataset],
+        batch_size: int,
+        shuffle: bool = True,
+        drop_last: bool = False,
+    ) -> None:
         self.datasets = datasets
         self.batch_size = batch_size
         self.shuffle = shuffle
@@ -525,16 +558,15 @@ class ProportionalMultiDatasetSampler:
                 dataset,
                 batch_size=batch_size,
                 shuffle=shuffle,
-                drop_last=drop_last
-            ) for dataset in datasets
+                drop_last=drop_last,
+            )
+            for dataset in datasets
         ]
 
-        self.iterators = [iter(dataloader) for dataloader in self.dataloaders]
+        self.iterators: list[Iterator] = [iter(dataloader) for dataloader in self.dataloaders]
 
-    def __iter__(self) -> Iterator[Tuple[torch.Tensor, ...]]:
-        """
-        Yields batches by randomly selecting datasets proportional to their size.
-        """
+    def __iter__(self) -> Iterator[tuple[tuple[torch.Tensor, ...], int]]:
+        """Yield ``(batch, dataset_idx)`` by randomly selecting datasets."""
         self.iterators = [iter(dataloader) for dataloader in self.dataloaders]
 
         active_datasets = list(range(len(self.datasets)))

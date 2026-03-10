@@ -66,7 +66,7 @@ The sequence is parameterized as **learnable logits** `(B, 4, L)`:
 
 Three loss terms with **independent gradient computation and per-batch clipping**:
 
-1. **MRL loss**: `-(mrl1 + mrl2)/2 + (mrl1 - mrl2)²` — maximize mean MRL while minimizing variance between the two frames
+1. **MRL loss**: `-(w_mrl1 * mrl1 + (1 - w_mrl1) * mrl2)` — maximize weighted mean MRL across both reading frames. `w_mrl1` (default 0.5) controls the balance: higher values prioritize the upstream start, lower values prioritize the downstream start
 2. **Protein loss**: cross-entropy between predicted AA sequence and target AA sequence — enforces the protein constraint
 3. **Edit loss**: smooth L1 distance to seed sequence (masked where seed is zero/padding)
 
@@ -95,6 +95,70 @@ Takes the best sequences from Phase 1 and refines them:
 - **`stratified_split`**: train/test split stratified by sequence length, with high-read-count sequences prioritized for the test set.
 - **`ProportionalMultiDatasetSampler`**: batches from multiple datasets proportional to their size — enables joint training across eGFP (unmod/pseudo/m1pseudo) and mCherry datasets with shared conv weights.
 
+## Configuration
+
+Optimization is configured via YAML files. A base config (`src/olg5utr/config_base.yaml`) provides defaults; experiment-specific overrides are layered on top:
+
+```python
+from olg5utr import BASE_CONFIG_PATH, OptimizationConfig
+config = OptimizationConfig.from_yaml(BASE_CONFIG_PATH, "my_experiment.yaml")
+```
+
+Multiple files are merged left-to-right — later files override earlier ones. Only specify the fields you want to change.
+
+### Key Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `seq_length` | 100 | Total nucleotide sequence length |
+| `alt_start_pos` | 50 | 0-based position of the A in the alternative ATG start codon |
+| `fix_aa_seq` | null | Target protein for the overlapping ORF. Single letters for exact residues, `[KR]` for degenerate (K or R), `X` for wildcard |
+| `right_overhang` | null | Fixed DNA nucleotides past the ORF end (e.g. `"A"`, `"TC"`) |
+| `seed_seq` | null | Optional seed DNA sequence (5' side, before alt_start) |
+| `w_mrl1` | 0.5 | Weight for MRL1 in loss (0–1). 0.5 = equal, 1.0 = MRL1 only |
+| `n_batch` | 10 | Number of sequences optimized in parallel |
+| `device` | cuda:0 | Compute device |
+
+### Reading Frame
+
+The reading frame of the overlapping ORF relative to the main CDS is determined by `alt_start_pos` and `seq_length`:
+
+```
+frame_offset = (alt_start_pos % 3 - seq_length % 3) % 3
+```
+
+For example, with `seq_length=100` (`100 % 3 = 1`):
+- `alt_start_pos=72` → `(0 - 1) % 3 = 2` → **+2 frame**
+- `alt_start_pos=71` → `(2 - 1) % 3 = 1` → **+1 frame**
+
+### GD / SA Sub-configs
+
+Gradient descent (`gd:`) and simulated annealing (`sa:`) each have their own block:
+
+```yaml
+gd:
+  min_steps: 1000       # minimum GD iterations
+  max_steps: 1000       # maximum GD iterations
+  learning_rate: 0.001
+  w_prot: 1.0           # protein gradient scale (relative to MRL grad norm)
+  w_edit: 0.5           # edit gradient scale (relative to MRL grad norm)
+sa:
+  steps: 2000           # SA iterations
+  max_mutations: 1      # mutations per step
+  tau0: 1.0e-08         # initial temperature (≈0 = greedy)
+```
+
+### Example Override
+
+```yaml
+# 8x[GS] degenerate protein, +2 frame, 100nt
+seq_length: 100
+alt_start_pos: 72
+fix_aa_seq: "[GS][GS][GS][GS][GS][GS][GS][GS]"
+right_overhang: A
+n_batch: 50
+```
+
 ## Data Flow
 
 ```
@@ -104,7 +168,7 @@ Random/Seed DNA logits (B, 4, 100)
     → Split into two UTR views
     → Optimus CNN → MRL₁, MRL₂
     → Translator CNN → predicted protein
-    → Loss = -mean(MRL) + var(MRL) + protein_CE + edit_distance
+    → Loss = -weighted_mean(MRL) + protein_CE + edit_distance
     → Gradient descent (clipped per-component)
     → Greedy/SA refinement with synonymous mutations
     → Output: optimized DNA sequence

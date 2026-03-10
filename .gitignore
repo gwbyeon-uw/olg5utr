@@ -2,3 +2,15 @@ __pycache__/
 *.pyc
 *.egg-info/
 .pytest_cache/
+
+# Analysis (experimental, not part of package)
+analysis/
+
+# User config files
+config_gs8.yaml
+
+# Tests
+tests/
+
+# Weights (large binary files)
+weights/

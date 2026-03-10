@@ -5,11 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "olg5utr"
 version = "0.1.0"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "torch>=2.0",
     "numpy",
     "biopython",
+    "pyyaml",
 ]
 
 [project.optional-dependencies]
@@ -24,5 +25,20 @@ dev = [
     "pytest",
 ]
 
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B", "SIM", "RUF", "C4", "PT", "RET", "PIE", "PERF"]
+ignore = []
+
+[tool.ruff.lint.isort]
+known-first-party = ["olg5utr"]
+force-sort-within-sections = true
+
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+olg5utr = ["config_base.yaml"]

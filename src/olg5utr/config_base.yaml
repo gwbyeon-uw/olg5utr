@@ -1,0 +1,31 @@
+n_batch: 10
+seq_length: 100
+alt_start_pos: 50
+start_codon: ATG
+fix_aa_seq: null
+right_overhang: null
+seed_seq: null
+w_mrl1: 0.5
+eps: 1.0e-08
+device: cuda:0
+model:
+  translator_channels: 1024
+  translator_weights_path: ./weights/translator_cnn_1024ch.pth
+  optimus_weights_path: ./weights/optimus_mrl_multi.pth
+gd:
+  min_steps: 1000
+  max_steps: 1000
+  learning_rate: 0.001
+  beta1: 0.9
+  beta2: 0.999
+  weight_decay: 0.01
+  w_prot: 1.0
+  w_edit: 0.5
+sa:
+  steps: 2000
+  max_mutations: 1
+  min_temp: 1.0e-08
+  anneal_rate: 1.0e-08
+  tau0: 1.0e-08
+  w_prot: 1.0
+  w_edit: 0.5
